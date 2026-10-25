@@ -34,3 +34,11 @@ gradle jar
 因运行时链接 GPL-3.0 组件，本附属同样以 **GPL-3.0** 分发。若需其他许可安排，请自行确认合规性。
 
 本仓库**不包含**任何第三方游戏资源，也不包含构建所需的依赖 jar（`libs/` 已列入 `.gitignore`）。
+
+## 依赖关系
+
+| 方向 | 项目 | 说明 |
+|---|---|---|
+| 运行依赖 | Superb Warfare (GPL-3.0) | 必需 |
+| 可选搭配 | [sbw-radar](https://github.com/zzy25565/sbw-radar) | 两者 HUD 分居屏幕左上与左下，同装不冲突 |
+| 被依赖 | [sbw-vls](https://github.com/zzy25565/sbw-vls) | 载具包中的 ERA / APS 数据由本模组解释 |
