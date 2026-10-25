@@ -17,3 +17,20 @@ Superb Warfare 主防与爆反附属（Minecraft 1.21.1 / NeoForge）。
 ```bash
 gradle jar
 ```
+
+---
+
+## 第三方依赖与许可
+
+本项目是 [Superb Warfare](https://github.com/atsuishio/superbwarfare) 的附属模组，运行时依赖该模组。
+
+| 项 | 说明 |
+|---|---|
+| 上游模组 | Superb Warfare（Atsuishio、Roki27、Light_Quanta 及贡献者） |
+| 上游许可 | **GNU GPL v3.0**（见其发布 jar 内 `COPYING` / `COPYING.LESSER`） |
+| 本仓库内容 | 仅为 ERA / APS 功能的原创实现，通过上游公开 API 交互 |
+| 是否包含上游文件 | **否**。不含 Superb Warfare 的源码、资源或二进制 |
+
+因运行时链接 GPL-3.0 组件，本附属同样以 **GPL-3.0** 分发。若需其他许可安排，请自行确认合规性。
+
+本仓库**不包含**任何第三方游戏资源，也不包含构建所需的依赖 jar（`libs/` 已列入 `.gitignore`）。
