@@ -1,0 +1,22 @@
+# build output
+build/
+out/
+*.class
+*.jar
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# local libs (third-party / copyrighted, not redistributable)
+libs/
+
+# os
+Thumbs.db
+.DS_Store
+
+# tokens / secrets
+*.token
+.gh_token
+.env

@@ -1,0 +1,34 @@
+modLoader="javafml"
+loaderVersion="[4,)"
+license="GPL-3.0-only"
+
+[[mods]]
+modId="sbw_defense"
+version="${file.jarVersion}"
+displayName="主防与爆反 (SBW Defense - ERA & APS)"
+authors="zzy"
+description='''Heavy ERA (tiered damage reduction) and hard-kill APS (real interceptor launch) for Superb Warfare vehicles.
+
+Every hit is resolved against a per-face grid: while a cell still holds a reactive block the round is blunted and the block is spent - 80% reduction against Superb Warfare's own ammo, 100% against external ammo namespaces (both configurable). External rounds still cook off when fully blocked, but their blast is capped (10 damage by default) so a point-blank detonation cannot wreck the hull; the APS applies the same cap to external warheads it takes out mid-air. Sub-100% hits keep SBW's own armour / impact-angle pipeline by scaling the projectile's warhead values instead of cancelling the hit. APS tube placement is per vehicle model and opt-in: azimuths, tube counts, launch points and blind sectors, plus ERA face coverage, come from config/sbw_defense-vehicle-layouts.json (pre-filled for the vehicles whose real counterparts carry Trophy / GL5 / Relikt / Kontakt / FY-4 / TUSK). Hulls missing from that table carry no hard-kill system at all.
+Standalone addon - does not require the radar addon. Compatible with SBW 0.8.9.1 / 0.8.9.2.'''
+
+[[dependencies.sbw_defense]]
+modId="neoforge"
+type="required"
+versionRange="[21.1.203,)"
+ordering="NONE"
+side="BOTH"
+
+[[dependencies.sbw_defense]]
+modId="minecraft"
+type="required"
+versionRange="[1.21.1,1.22)"
+ordering="NONE"
+side="BOTH"
+
+[[dependencies.sbw_defense]]
+modId="superbwarfare"
+type="required"
+versionRange="[0.8.9.1,)"
+ordering="AFTER"
+side="BOTH"

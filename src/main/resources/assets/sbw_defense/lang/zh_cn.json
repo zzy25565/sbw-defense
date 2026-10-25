@@ -1,0 +1,23 @@
+{
+  "sbw_defense.configuration.defense.vehicles": "启用主防与爆反的载具（实体 ID，\"*\" 为全部）",
+  "sbw_defense.configuration.defense.era.enable": "启用爆反装甲逐块吸收",
+  "sbw_defense.configuration.defense.era.cellsPerFace": "每个面的爆反格数（前/后/左/右/顶）",
+  "sbw_defense.configuration.defense.era.blocksPerCell": "每格叠放的爆反块数（决定该格能挨几下）",
+  "sbw_defense.configuration.defense.era.reduction.internal": "对卓越前线自家弹药的减伤（0.8 = 仍吃 20% 伤害）",
+  "sbw_defense.configuration.defense.era.reduction.external": "对外部弹药的减伤（1.0 = 完全挡下）",
+  "sbw_defense.configuration.defense.era.keepExplosion": "完全挡下时保留战斗部原版爆炸（关闭则连爆炸一起吞掉）",
+  "sbw_defense.configuration.defense.externalBlastCap": "外部弹药爆炸伤害上限（10 = 爆心最多 10 点）",
+  "sbw_defense.configuration.defense.era.onlyExplosive": "只挡化学能弹（导弹/火箭/炮弹），普通箭矢穿透",
+  "sbw_defense.configuration.defense.aps.enable": "启用硬杀主动防御（发射真实拦截弹）",
+  "sbw_defense.configuration.defense.aps.reloadTicks": "每扇区再装填时间（刻）",
+  "sbw_defense.configuration.defense.aps.radius": "拦截探测半径（格）",
+  "sbw_defense.configuration.defense.aps.killRadius": "拦截弹引爆距离（格）",
+  "sbw_defense.configuration.defense.aps.minClosingSpeed": "判定为威胁的最低接近速度（格/刻）",
+  "sbw_defense.configuration.defense.aps.interceptor": "拦截弹使用的实体 ID",
+  "sbw_defense.configuration.defense.aps.warheadDetonates": "被拦截的弹在拦截点照样炸开（关闭则直接消失）",
+  "sbw_defense.configuration.defense.syncInterval": "HUD 状态同步间隔（刻）",
+  "sbw_defense.configuration.hud.enable": "显示爆反/主防面板",
+  "sbw_defense.configuration.hud.offsetX": "面板水平偏移（像素，正数向右）",
+  "sbw_defense.configuration.hud.offsetY": "面板垂直偏移（像素，正数向下）",
+  "sbw_defense.configuration.hud.labels": "显示 ERA / APS 文字标签（关闭则仅图标）"
+}

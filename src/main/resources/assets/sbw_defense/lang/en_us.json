@@ -1,0 +1,23 @@
+{
+  "sbw_defense.configuration.defense.vehicles": "Vehicles that get ERA / APS (entity ids, \"*\" for all)",
+  "sbw_defense.configuration.defense.era.enable": "Enable per-block heavy ERA absorption",
+  "sbw_defense.configuration.defense.era.cellsPerFace": "ERA grid cells per face (front/back/left/right/top)",
+  "sbw_defense.configuration.defense.era.blocksPerCell": "Blocks stacked in one grid cell",
+  "sbw_defense.configuration.defense.era.reduction.internal": "Reduction vs Superb Warfare's own ammo (0.8 = still takes 20%)",
+  "sbw_defense.configuration.defense.era.reduction.external": "Reduction vs external ammo namespaces (1.0 = fully stopped)",
+  "sbw_defense.configuration.defense.era.keepExplosion": "Fully-blocked hits still detonate with their original blast",
+  "sbw_defense.configuration.defense.externalBlastCap": "Explosion damage cap for external warheads (10 = at most 10 at the centre)",
+  "sbw_defense.configuration.defense.era.onlyExplosive": "Only chemical-energy projectiles are absorbed",
+  "sbw_defense.configuration.defense.aps.enable": "Enable hard-kill APS (real interceptor launch)",
+  "sbw_defense.configuration.defense.aps.reloadTicks": "Reload time per sector (ticks)",
+  "sbw_defense.configuration.defense.aps.radius": "Detection radius (blocks)",
+  "sbw_defense.configuration.defense.aps.killRadius": "Interceptor detonation distance (blocks)",
+  "sbw_defense.configuration.defense.aps.minClosingSpeed": "Minimum closing speed to count as a threat",
+  "sbw_defense.configuration.defense.aps.interceptor": "Entity used as the interceptor",
+  "sbw_defense.configuration.defense.aps.warheadDetonates": "Intercepted projectiles still cook off where they were met",
+  "sbw_defense.configuration.defense.syncInterval": "HUD state sync interval (ticks)",
+  "sbw_defense.configuration.hud.enable": "Show the ERA / APS panel",
+  "sbw_defense.configuration.hud.offsetX": "Panel horizontal offset (pixels, + = right)",
+  "sbw_defense.configuration.hud.offsetY": "Panel vertical offset from the top edge (pixels, + = down)",
+  "sbw_defense.configuration.hud.labels": "Draw the ERA / APS text labels"
+}
