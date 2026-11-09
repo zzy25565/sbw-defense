@@ -2,7 +2,8 @@
 
 Superb Warfare 主防与爆反附属（Minecraft 1.21.1 / NeoForge）。
 
-> 当前版本 **1.9.0**。仓库只放源码，编译依赖（`libs/`）因版权不随仓库分发。
+> 当前版本 **1.9.0**，成品 jar 见 [Releases](https://github.com/zzy25565/sbw-defense/releases/latest)。
+> 仓库只放源码，编译依赖（`libs/`）因版权不随仓库分发。
 
 ## 功能
 
