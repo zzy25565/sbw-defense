@@ -18,10 +18,11 @@ import org.slf4j.LoggerFactory;
  *
  * <ul>
  *   <li><b>ERA</b> - per-block heavy reactive armour: the hull is split into faces and
- *       cells, a hit consumes the block covering the hit point (event cancelled).</li>
+ *       cells, a hit consumes the block covering the hit point and blunts the round.</li>
  *   <li><b>APS</b> - hard-kill active protection: closing projectiles inside the detection
- *       ring are engaged by a real interceptor entity launched from the covering sector.</li>
- *   <li><b>HUD</b> - own bottom-left panel (ERA percentage + per-sector tube status), no
+ *       ring are engaged by a real interceptor entity launched from the covering sector;
+ *       one hull is updated once per tick and one threat carries one interceptor at a time.</li>
+ *   <li><b>HUD</b> - own top-left panel (ERA percentage + per-sector tube status), no
  *       longer piggy-backing on the radar state packet.</li>
  * </ul>
  */

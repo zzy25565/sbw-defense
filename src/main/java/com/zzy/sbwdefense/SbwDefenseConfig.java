@@ -83,6 +83,13 @@ public final class SbwDefenseConfig {
                     "Keeps dropped items and slow lobs from draining the tubes")
             .defineInRange("defense.aps.minClosingSpeed", 0.35, 0.0, 4.0);
 
+    public static final ModConfigSpec.IntValue APS_ENGAGE_TIMEOUT = BUILDER
+            .comment("Ticks one interceptor may stay assigned to the same threat before the lock is",
+                    "released. Until it expires no other tube will fire at that projectile, so a target",
+                    "the interceptor cannot catch would otherwise keep a whole sector busy forever.",
+                    "120 = 6 seconds")
+            .defineInRange("defense.aps.engageTimeout", 120, 20, 600);
+
     public static final ModConfigSpec.ConfigValue<String> APS_INTERCEPTOR = BUILDER
             .comment("Entity used as the interceptor body")
             .define("defense.aps.interceptor", "superbwarfare:fim_92_missile");

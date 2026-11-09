@@ -38,15 +38,26 @@ public final class DefensePayloads {
         }
     }
 
-    /** Fired the moment an interceptor leaves a tube; drives the HUD flash. */
-    public record Intercept(int sector) implements CustomPacketPayload {
+    /**
+     * An APS event on one specific hull - launch or confirmed kill.
+     *
+     * @param vehicleId entity id of the vehicle that fired, so a HUD can ignore other people's tanks
+     * @param sector    tube group index (HUD bit position)
+     * @param killed    {@code true} = the interceptor reached its target; {@code false} = a tube
+     *                  just fired and the outcome is still open
+     */
+    public record Intercept(int vehicleId, int sector, boolean killed) implements CustomPacketPayload {
 
         public static final Type<Intercept> TYPE = new Type<>(
                 ResourceLocation.fromNamespaceAndPath(SbwDefenseMod.MODID, "intercept"));
 
         public static final StreamCodec<FriendlyByteBuf, Intercept> CODEC = StreamCodec.of(
-                (buf, p) -> buf.writeByte(p.sector()),
-                buf -> new Intercept(buf.readUnsignedByte()));
+                (buf, p) -> {
+                    buf.writeVarInt(p.vehicleId());
+                    buf.writeByte(p.sector());
+                    buf.writeBoolean(p.killed());
+                },
+                buf -> new Intercept(buf.readVarInt(), buf.readUnsignedByte(), buf.readBoolean()));
 
         @Override
         public Type<? extends CustomPacketPayload> type() {

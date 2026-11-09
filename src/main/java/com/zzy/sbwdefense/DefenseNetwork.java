@@ -1,9 +1,8 @@
 package com.zzy.sbwdefense;
 
 import com.atsuishio.superbwarfare.entity.vehicle.base.VehicleEntity;
-import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
-import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.entity.Entity;
 import net.neoforged.neoforge.network.PacketDistributor;
 import net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent;
 import net.neoforged.neoforge.network.registration.PayloadRegistrar;
@@ -18,7 +17,8 @@ public final class DefenseNetwork {
                 (payload, context) -> context.enqueueWork(() -> ClientDefenseState.set(payload)));
 
         registrar.playToClient(DefensePayloads.Intercept.TYPE, DefensePayloads.Intercept.CODEC,
-                (payload, context) -> context.enqueueWork(() -> ClientDefenseState.flash(payload.sector())));
+                (payload, context) -> context.enqueueWork(() -> ClientDefenseState.flash(
+                        payload.vehicleId(), payload.sector(), payload.killed())));
     }
 
     /** Push the current ERA / APS state of {@code v} to the player crewing it. */
@@ -31,12 +31,25 @@ public final class DefenseNetwork {
                 SbwDefenseConfig.APS_ENABLE.get()));
     }
 
-    /** Tell nearby players that a tube just fired (HUD flash + soft confirmation of the kill). */
-    public static void flashNear(ServerLevel level, Vec3 at, int sector) {
-        DefensePayloads.Intercept payload = new DefensePayloads.Intercept(sector);
-        double r2 = 96.0 * 96.0;
-        for (ServerPlayer p : level.players()) {
-            if (p.distanceToSqr(at) <= r2) PacketDistributor.sendToPlayer(p, payload);
+    /** A tube just fired. Only the crew of that hull hears about it, and only as a soft hint. */
+    public static void notifyLaunch(VehicleEntity v, int sector) {
+        sendToCrew(v, new DefensePayloads.Intercept(v.getId(), sector, false));
+    }
+
+    /** The interceptor reached its target - this is the one that gets the INTERCEPT banner. */
+    public static void notifyKill(VehicleEntity v, int sector) {
+        sendToCrew(v, new DefensePayloads.Intercept(v.getId(), sector, true));
+    }
+
+    /**
+     * Crew only: broadcasting to everyone within 96 blocks made other people's tanks flash a
+     * "your APS killed something" banner on your HUD. The HUD filters by vehicle id as well.
+     */
+    private static void sendToCrew(VehicleEntity v, DefensePayloads.Intercept payload) {
+        for (Entity passenger : v.getPassengers()) {
+            if (passenger instanceof ServerPlayer player) {
+                PacketDistributor.sendToPlayer(player, payload);
+            }
         }
     }
 

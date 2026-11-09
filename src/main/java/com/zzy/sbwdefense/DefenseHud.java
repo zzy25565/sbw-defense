@@ -74,11 +74,15 @@ public final class DefenseHud {
         }
         g.drawString(font, line, x, y, color);
 
-        // intercept flash stays, it is the only event that must break through
-        float flash = ClientDefenseState.flashLevel();
+        // intercept flash stays, it is the only event that must break through - but only for the
+        // hull we are riding, and a confirmed kill reads differently from a tube just firing
+        float flash = ClientDefenseState.flashLevel(v.getId());
         if (flash > 0.05F) {
+            boolean kill = ClientDefenseState.flashKilled(v.getId());
+            String text = kill ? "INTERCEPT" : "LAUNCH";
+            int rgb = kill ? 0x00E8B33C : 0x0090A0A8;
             int alpha = (int) (flash * 255.0F) << 24;
-            g.drawString(font, "INTERCEPT", x + font.width(line) + 8, y, alpha | 0x00E8B33C);
+            g.drawString(font, text, x + font.width(line) + 8, y, alpha | rgb);
         }
     }
 

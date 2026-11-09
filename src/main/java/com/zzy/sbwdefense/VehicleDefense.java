@@ -24,11 +24,15 @@ import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.event.entity.EntityLeaveLevelEvent;
 import net.neoforged.neoforge.event.tick.ServerTickEvent;
 
+import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Heavy ERA (per block) + hard-kill APS (real interceptor launch) for SBW vehicles.
@@ -47,6 +51,11 @@ import java.util.UUID;
  * launches a real interceptor entity at it. The interceptor homes on the threat; within a few
  * blocks it detonates and kills the threat.
  *
+ * <p>Every vehicle is updated exactly once per tick even with a full crew, and a threat that
+ * already has an interceptor in the air is never assigned a second one: the shot is tracked in
+ * {@link #SHOTS}, the target in {@link #ENGAGED}, and the lock is released on kill, on interceptor
+ * loss or after {@code defense.aps.engageTimeout} ticks.
+ *
  * <p>State is keyed by vehicle UUID (not the transient entity id) so recycled ids can never
  * inherit another tank's spent armour, and it is dropped when the vehicle leaves the level.
  */
@@ -56,25 +65,37 @@ public final class VehicleDefense {
 
     private enum Face { FRONT, BACK, LEFT, RIGHT, TOP }
 
+    /** Cached {@code Face.values()} - avoids a defensive array copy on every hit. */
+    private static final Face[] FACES = Face.values();
+
+    /**
+     * How close to a cell seam a hit must land before the neighbouring cell may absorb it.
+     * Expressed as a fraction of one cell's width ({@code 0.15} = outer 15 % on either side).
+     */
+    private static final double SEAM_FRACTION = 0.15;
+
     private static final class EraState {
-        /** blocks per face cell, keyed {@code FACE:index} */
-        final Map<String, Integer> blocks = new HashMap<>();
+        /** Layout this state was built from - compared by identity to spot a table swap. */
+        final DefenseLayouts.Layout layout;
+        /** remaining blocks, indexed {@code [face ordinal][cell]} */
+        final int[][] blocks;
         /** cell count of each face, in Face ordinal order - a layout may leave a face bare */
         final int[] cells;
         final int blocksPerCell;
         final int total;
         int left;
 
-        EraState(int[] cellsPerFace, int blocksPerCell) {
-            cells = cellsPerFace.clone();
+        EraState(DefenseLayouts.Layout layout, int[] cellsPerFace, int blocksPerCell) {
+            this.layout = layout;
+            this.cells = cellsPerFace.clone();
             this.blocksPerCell = blocksPerCell;
+            this.blocks = new int[FACES.length][];
             int sum = 0;
-            Face[] faces = Face.values();
-            for (int f = 0; f < faces.length; f++) {
-                for (int i = 0; i < cells[f]; i++) {
-                    blocks.put(faces[f].name() + ":" + i, blocksPerCell);
-                    sum += blocksPerCell;
-                }
+            for (int f = 0; f < FACES.length; f++) {
+                int n = Math.max(0, cells[f]);
+                blocks[f] = new int[n];
+                if (n > 0) Arrays.fill(blocks[f], blocksPerCell);
+                sum += n * blocksPerCell;
             }
             total = sum;
             left = total;
@@ -88,12 +109,15 @@ public final class VehicleDefense {
     // ── APS ────────────────────────────────────────────────────────────────
 
     private static final class ApsState {
+        /** Layout this state was built from - compared by identity to spot a table swap. */
+        final DefenseLayouts.Layout layout;
         /** capacity per sector, straight from the vehicle's layout (0 = blind spot) */
         final int[] max;
         final int[] tubes;
         final int[] reload;
 
-        ApsState(int[] maxTubes) {
+        ApsState(DefenseLayouts.Layout layout, int[] maxTubes) {
+            this.layout = layout;
             max = maxTubes.clone();
             tubes = maxTubes.clone();
             reload = new int[maxTubes.length];
@@ -108,16 +132,41 @@ public final class VehicleDefense {
         }
     }
 
+    /** One interceptor in flight: what it was fired at, from which hull and tube group. */
+    private static final class Shot {
+        final Entity threat;
+        final VehicleEntity vehicle;
+        final int sector;
+        int ttl;
+
+        Shot(Entity threat, VehicleEntity vehicle, int sector, int ttl) {
+            this.threat = threat;
+            this.vehicle = vehicle;
+            this.sector = sector;
+            this.ttl = ttl;
+        }
+    }
+
     private static final Map<UUID, EraState> ERA = new HashMap<>();
     private static final Map<UUID, ApsState> APS = new HashMap<>();
-    /** interceptor entity -> threat entity */
-    private static final Map<Entity, Entity> INTERCEPTORS = new HashMap<>();
+    /** interceptor entity -> the shot it belongs to */
+    private static final Map<Entity, Shot> SHOTS = new HashMap<>();
+    /** threat entity -> the interceptor already assigned to it (no double spending) */
+    private static final Map<Entity, Entity> ENGAGED = new HashMap<>();
+    /** vehicles already ticked this server tick - one update per hull, no matter the crew */
+    private static final Set<UUID> TICKED = new HashSet<>();
 
     /** Registry-path keywords treated as chemical-energy / warhead threats. */
     private static final String[] WARHEAD_HINTS = {
             "shell", "missile", "rocket", "grenade", "bomb", "rpg", "torpedo",
             "cannon", "apfsds", "heat", "hesh", "atgm"
     };
+
+    /** Warhead verdict per entity type - the registry path never changes at runtime. */
+    private static final Map<EntityType<?>, Boolean> WARHEAD_CACHE = new ConcurrentHashMap<>();
+    /** {@code defense.vehicles} verdict per entity type - dropped when the config list changes. */
+    private static final Map<EntityType<?>, Boolean> COVERED_CACHE = new ConcurrentHashMap<>();
+    private static List<? extends String> coveredListRef;
 
     // ── ERA hit handling ──────────────────────────────────────────────────
 
@@ -131,25 +180,17 @@ public final class VehicleDefense {
         EraState st = era(vehicle);
         if (st == null || st.left <= 0) return;
 
-        Face face = faceOf(vehicle, event.getHitVec());
-        int cells = st.cells[face.ordinal()];
+        // one world -> hull conversion feeds both the face and the cell, so they can never disagree
+        Vec3 local = toLocal(vehicle, event.getHitVec());
+        Face face = faceOf(local);
+        int fi = face.ordinal();
+        int cells = st.cells[fi];
         if (cells <= 0) return;                  // this face carries no ERA at all
-        int cell = cellOf(vehicle, face, event.getHitVec(), cells);
-        String key = face.name() + ":" + cell;
+        double t = alongT(vehicle, face, local);
+        int use = pickCell(st.blocks[fi], t);
+        if (use < 0) return;                     // this face is stripped: normal penetration
 
-        // if this cell is empty look at the neighbours (a hit right on a seam should still count)
-        String use = null;
-        if (st.blocks.getOrDefault(key, 0) > 0) {
-            use = key;
-        } else {
-            for (int d = -1; d <= 1 && use == null; d++) {
-                String alt = face.name() + ":" + Math.floorMod(cell + d, cells);
-                if (st.blocks.getOrDefault(alt, 0) > 0) use = alt;
-            }
-        }
-        if (use == null) return; // that face is stripped: normal penetration
-
-        st.blocks.put(use, st.blocks.get(use) - 1);
+        st.blocks[fi][use]--;
         st.left--;
 
         // A block is spent either way. What differs is how much of the round survives:
@@ -158,13 +199,13 @@ public final class VehicleDefense {
         //                     cook-off cannot wreck the hull.
         //  * internal ammo -> scale the projectile's own damage / explosion fields and let SBW's
         //                     normal pipeline run, so armour, impact angle and part damage apply.
-        float reduction = reductionFor(event.getProjectile());
+        boolean external = isExternalAmmo(event.getProjectile());
+        float keep = 1.0F - reductionFor(external);
         if (event.getProjectile() instanceof IBulletProperties warhead) {
-            float keep = 1.0F - reduction;
             warhead.setDamage(warhead.getDamage() * keep);
-            if (isExternalAmmo(event.getProjectile())) {
+            if (external) {
                 if (SbwDefenseConfig.ERA_KEEP_EXPLOSION.get()) {
-                    capExternalBlast(event.getProjectile(), warhead);
+                    capExternalBlast(warhead, external);
                 } else {
                     warhead.setExplosionDamage(0.0F);
                 }
@@ -182,6 +223,81 @@ public final class VehicleDefense {
         }
     }
 
+    /**
+     * World offset -&gt; hull space, shared by hit location and muzzle placement.
+     *
+     * <p>Minecraft yaw grows clockwise seen from above, so a hull facing {@code yaw} has
+     * {@code forward = (-sin, 0, cos)} and {@code right = forward × up = (-cos, 0, -sin)}.
+     * Rotating the offset onto those two basis vectors is the inverse of the muzzle transform;
+     * the two must always use the same convention or front hits land on the rear plate at 90°.
+     *
+     * @return {@code (x = right, y = up, z = forward)} relative to the hull origin
+     */
+    private static Vec3 toLocal(VehicleEntity v, Vec3 world) {
+        Vec3 d = world.subtract(v.position());
+        double yaw = Math.toRadians(v.getYRot());
+        double sin = Math.sin(yaw);
+        double cos = Math.cos(yaw);
+        return new Vec3(
+                -d.x * cos - d.z * sin,   // right
+                d.y,                      // up
+                -d.x * sin + d.z * cos);  // forward
+    }
+
+    /** Face of a hit, given hull-space offset. */
+    private static Face faceOf(Vec3 local) {
+        if (local.y > 1.6) return Face.TOP;
+        if (Math.abs(local.x) > Math.abs(local.z)) return local.x > 0 ? Face.RIGHT : Face.LEFT;
+        return local.z > 0 ? Face.FRONT : Face.BACK;
+    }
+
+    /** Position of the hit along its face, normalised to 0..1 (may fall slightly outside). */
+    private static double alongT(VehicleEntity v, Face face, Vec3 local) {
+        double along = switch (face) {
+            case FRONT, BACK -> local.x;   // left-to-right sweep across the glacis / tail plate
+            case LEFT, RIGHT -> local.z;   // front-to-back sweep along the skirt
+            case TOP -> local.x;
+        };
+        double half = switch (face) {
+            case FRONT, BACK -> Math.max(1.2, v.getBbWidth() / 2.0);
+            case LEFT, RIGHT, TOP -> Math.max(1.6, v.getBbWidth() / 2.0);
+        };
+        return (along + half) / (2 * half);
+    }
+
+    /** Cell index for a normalised face coordinate, clamped into the face. */
+    private static double clampT(double t) {
+        if (t <= 0.0) return 0.0;
+        return t >= 1.0 ? Math.nextDown(1.0) : t;
+    }
+
+    /**
+     * Cell that actually absorbs the hit: the cell under {@code t} when it still holds a block,
+     * otherwise a neighbour - but only when the hit landed within {@link #SEAM_FRACTION} of the
+     * shared seam. A hit in the middle of a stripped cell passes through instead of magically
+     * eating the block two metres away, and the first and last cell of a face are never treated
+     * as adjacent.
+     *
+     * <p>The cell index is derived here from {@code t} rather than passed in, so the two can
+     * never disagree (a mismatch would make {@code within} fall outside 0..1 and borrow a
+     * neighbour that is nowhere near the hit).
+     *
+     * @return cell index to spend, or {@code -1} when nothing covers this point
+     */
+    private static int pickCell(int[] cellBlocks, double t) {
+        int n = cellBlocks.length;
+        if (n == 0) return -1;
+
+        double clamped = clampT(t);
+        int cell = Math.min(n - 1, (int) Math.floor(clamped * n));
+        if (cellBlocks[cell] > 0) return cell;
+
+        double within = clamped * n - cell;      // 0..1, where the hit sits inside this cell
+        if (within < SEAM_FRACTION && cell > 0 && cellBlocks[cell - 1] > 0) return cell - 1;
+        if (1.0 - within < SEAM_FRACTION && cell < n - 1 && cellBlocks[cell + 1] > 0) return cell + 1;
+        return -1;
+    }
+
     /** External ammo = anything not registered under the {@code superbwarfare} namespace. */
     private static boolean isExternalAmmo(Entity projectile) {
         ResourceLocation id = BuiltInRegistries.ENTITY_TYPE.getKey(projectile.getType());
@@ -192,8 +308,8 @@ public final class VehicleDefense {
      * External warheads detonate, but never harder than {@code defense.externalBlastCap}.
      * Used both when ERA blocks the hit and when the APS takes the round out mid-air.
      */
-    private static void capExternalBlast(Entity projectile, IBulletProperties warhead) {
-        if (!isExternalAmmo(projectile)) return;
+    private static void capExternalBlast(IBulletProperties warhead, boolean external) {
+        if (!external) return;
         float cap = (float) (double) SbwDefenseConfig.EXTERNAL_BLAST_CAP.get();
         if (warhead.getExplosionDamage() > cap) warhead.setExplosionDamage(cap);
     }
@@ -202,8 +318,8 @@ public final class VehicleDefense {
      * ERA reduction for this round: Superb Warfare's own ammo ({@code superbwarfare:*}) uses the
      * internal figure, every other namespace (addons, other mods) the external one.
      */
-    private static float reductionFor(Entity projectile) {
-        double v = isExternalAmmo(projectile)
+    private static float reductionFor(boolean external) {
+        double v = external
                 ? SbwDefenseConfig.ERA_EXTERNAL_REDUCTION.get()
                 : SbwDefenseConfig.ERA_INTERNAL_REDUCTION.get();
         return (float) Math.max(0.0, Math.min(1.0, v));
@@ -220,42 +336,11 @@ public final class VehicleDefense {
                 SoundSource.PLAYERS, 0.45F + 0.25F * strength, 1.6F);
     }
 
-    private static Face faceOf(VehicleEntity v, Vec3 hit) {
-        Vec3 local = hit.subtract(v.position());
-        if (local.y > 1.6) return Face.TOP;
-        double yaw = Math.toRadians(v.getYRot());
-        // rotate into vehicle space: x = right, z = forward
-        double fx = local.x * Math.cos(yaw) - local.z * Math.sin(yaw);
-        double fz = local.x * Math.sin(yaw) + local.z * Math.cos(yaw);
-        if (Math.abs(fx) > Math.abs(fz)) return fx > 0 ? Face.RIGHT : Face.LEFT;
-        return fz > 0 ? Face.FRONT : Face.BACK;
-    }
-
-    private static int cellOf(VehicleEntity v, Face face, Vec3 hit, int cells) {
-        Vec3 local = hit.subtract(v.position());
-        double yaw = Math.toRadians(v.getYRot());
-        double fx = local.x * Math.cos(yaw) - local.z * Math.sin(yaw);
-        double fz = local.x * Math.sin(yaw) + local.z * Math.cos(yaw);
-        double along = switch (face) {
-            case FRONT, BACK -> fx;
-            case LEFT, RIGHT -> fz;
-            case TOP -> fx;
-        };
-        double half = switch (face) {
-            case FRONT, BACK -> Math.max(1.2, v.getBbWidth() / 2.0);
-            case LEFT, RIGHT -> Math.max(1.6, v.getBbWidth() / 2.0);
-            case TOP -> Math.max(1.6, v.getBbWidth() / 2.0);
-        };
-        double t = (along + half) / (2 * half);           // 0..1
-        int idx = (int) Math.floor(t * cells);
-        return Math.max(0, Math.min(cells - 1, idx));
-    }
-
     // ── APS ────────────────────────────────────────────────────────────────
 
     @SubscribeEvent
     public static void onServerTick(ServerTickEvent.Post event) {
-        if (!INTERCEPTORS.isEmpty()) tickInterceptors();
+        if (!SHOTS.isEmpty()) tickInterceptors();
 
         boolean apsOn = SbwDefenseConfig.APS_ENABLE.get();
         int interval = Math.max(1, SbwDefenseConfig.SYNC_INTERVAL.get());
@@ -263,11 +348,13 @@ public final class VehicleDefense {
         for (ServerLevel level : event.getServer().getAllLevels()) {
             if (level.players().isEmpty()) continue;
             boolean syncNow = level.getGameTime() % interval == 0;
+            TICKED.clear();   // hulls never span levels, so one set per level is enough
             for (ServerPlayer player : level.players()) {
                 if (!(player.getVehicle() instanceof VehicleEntity v)) continue;
                 if (v.isWreck() || !isCovered(v)) continue;
                 if (syncNow) DefenseNetwork.sync(player, v);
-                if (apsOn) tickAps(level, v);
+                // a four-man crew must not run four APS updates (and four reload ticks) per tick
+                if (apsOn && TICKED.add(v.getUUID())) tickAps(level, v);
             }
         }
     }
@@ -275,7 +362,7 @@ public final class VehicleDefense {
     private static void tickAps(ServerLevel level, VehicleEntity v) {
         ApsState st = aps(v);
         if (st == null || st.max.length == 0) return;
-        int sectors = st.max.length;
+        final int sectors = st.max.length;
 
         // reload - each sector refills to its own capacity (a vehicle may carry 2 up front, 1 aft)
         for (int i = 0; i < sectors; i++) {
@@ -297,9 +384,10 @@ public final class VehicleDefense {
         double minClosing = SbwDefenseConfig.APS_MIN_SPEED.get();
 
         for (Entity e : near) {
-            if (INTERCEPTORS.containsKey(e)) continue;      // never engage our own interceptors
+            if (SHOTS.containsKey(e)) continue;              // never engage our own interceptors
+            if (ENGAGED.containsKey(e)) continue;            // already has a round in the air
             if (isOwnedByVehicleCrew(e, v)) continue;
-            if (!isWarhead(e)) continue;                    // arrows / eggs are not worth a tube
+            if (!isWarhead(e)) continue;                     // arrows / eggs are not worth a tube
             Vec3 rel = e.position().subtract(center);
             double dist = rel.length();
             if (dist < 2.0 || dist > radius) continue;
@@ -307,7 +395,7 @@ public final class VehicleDefense {
             double closing = e.getDeltaMovement().dot(rel.normalize().scale(-1));
             if (closing <= Math.max(0.05, minClosing)) continue;
 
-            int sector = sectorOf(v, rel, sectors);
+            int sector = sectorOf(v, st.layout, rel, sectors);
             if (sector < 0 || sector >= sectors || st.tubes[sector] <= 0) continue;
             if (dist < bestDist) {
                 bestDist = dist;
@@ -318,13 +406,16 @@ public final class VehicleDefense {
         if (best == null) return;
 
         // launch from the tube cluster that actually covers the threat, not from the hull centre
-        Vec3 muzzle = muzzle(v, bestSector);
+        Vec3 muzzle = muzzle(v, st.layout, bestSector);
         Entity interceptor = launchInterceptor(level, v, best, muzzle);
         if (interceptor == null) return;
         st.tubes[bestSector]--;
         st.reload[bestSector] = 0;
-        INTERCEPTORS.put(interceptor, best);
-        DefenseNetwork.flashNear(level, muzzle, bestSector);
+
+        int ttl = Math.max(1, SbwDefenseConfig.APS_ENGAGE_TIMEOUT.get());
+        SHOTS.put(interceptor, new Shot(best, v, bestSector, ttl));
+        ENGAGED.put(best, interceptor);   // this threat is taken: no second tube until released
+        DefenseNetwork.notifyLaunch(v, bestSector);
     }
 
     /**
@@ -332,8 +423,7 @@ public final class VehicleDefense {
      * {@code mount} offset rotated into world space, or the hull centre at y+1.2 when that
      * vehicle entry carries no mount (the old behaviour).
      */
-    private static Vec3 muzzle(VehicleEntity v, int sectorIndex) {
-        DefenseLayouts.Layout layout = DefenseLayouts.forVehicle(v);
+    private static Vec3 muzzle(VehicleEntity v, DefenseLayouts.Layout layout, int sectorIndex) {
         float[] mount = layout != null && sectorIndex >= 0 && sectorIndex < layout.count()
                 ? layout.sectors().get(sectorIndex).mount()
                 : null;
@@ -341,7 +431,7 @@ public final class VehicleDefense {
         double ly = mount == null ? 1.2 : mount[1];   // +Y up
         double lz = mount == null ? 0.0 : mount[2];   // +Z forward
         double yaw = Math.toRadians(v.getYRot());
-        // MC yaw grows clockwise: forward = (-sin, cos), right = (-cos, -sin)
+        // inverse of toLocal(): forward = (-sin, cos), right = (-cos, -sin)
         double wx = -Math.sin(yaw) * lz - Math.cos(yaw) * lx;
         double wz = Math.cos(yaw) * lz - Math.sin(yaw) * lx;
         return v.position().add(wx, ly, wz);
@@ -353,12 +443,11 @@ public final class VehicleDefense {
      * <p>The answer comes from the vehicle's own table - azimuths and tube counts differ per model.
      * Hulls without an entry never get here, because they carry no tubes.
      */
-    private static int sectorOf(VehicleEntity v, Vec3 rel, int sectors) {
+    private static int sectorOf(VehicleEntity v, DefenseLayouts.Layout layout, Vec3 rel, int sectors) {
         // Minecraft yaw: 0 = +Z, increasing clockwise seen from above, so this is the true bearing.
         double bearing = Math.toDegrees(Math.atan2(-rel.x, rel.z));
         double relYaw = ((bearing - v.getYRot()) % 360.0 + 540.0) % 360.0 - 180.0;
 
-        DefenseLayouts.Layout layout = DefenseLayouts.forVehicle(v);
         if (layout != null && layout.count() > 0) return layout.sectorFor(relYaw);
 
         // no table: split the ring evenly (only reachable if a table lists tubes without sectors)
@@ -396,17 +485,28 @@ public final class VehicleDefense {
     }
 
     private static void tickInterceptors() {
-        for (Iterator<Map.Entry<Entity, Entity>> it = INTERCEPTORS.entrySet().iterator(); it.hasNext(); ) {
-            Map.Entry<Entity, Entity> e = it.next();
-            Entity mi = e.getKey();
-            Entity threat = e.getValue();
+        for (Iterator<Map.Entry<Entity, Shot>> it = SHOTS.entrySet().iterator(); it.hasNext(); ) {
+            Map.Entry<Entity, Shot> entry = it.next();
+            Entity mi = entry.getKey();
+            Shot shot = entry.getValue();
+            Entity threat = shot.threat;
+
             if (mi.isRemoved() || !mi.isAlive() || mi.level() == null) {
                 it.remove();
+                ENGAGED.remove(threat, mi);      // interceptor lost: let the next tube try
                 continue;
             }
             if (threat == null || !threat.isAlive() || threat.isRemoved()) {
                 mi.discard();
                 it.remove();
+                ENGAGED.remove(threat, mi);
+                continue;
+            }
+            if (--shot.ttl <= 0) {
+                // never caught up (evasive or faster than the interceptor): release the lock
+                mi.discard();
+                it.remove();
+                ENGAGED.remove(threat, mi);
                 continue;
             }
             // keep the seeker pointed at the threat
@@ -416,6 +516,9 @@ public final class VehicleDefense {
             }
             if (mi.distanceTo(threat) <= SbwDefenseConfig.APS_KILL_RADIUS.get()) {
                 detonate(threat);
+                if (shot.vehicle != null && shot.vehicle.isAlive() && !shot.vehicle.isRemoved()) {
+                    DefenseNetwork.notifyKill(shot.vehicle, shot.sector);
+                }
                 if (mi.level() instanceof ServerLevel level) {
                     level.sendParticles(ParticleTypes.EXPLOSION, mi.getX(), mi.getY(), mi.getZ(),
                             1, 0, 0, 0, 0);
@@ -424,6 +527,7 @@ public final class VehicleDefense {
                 }
                 mi.discard();
                 it.remove();
+                ENGAGED.remove(threat, mi);
             }
         }
     }
@@ -435,7 +539,7 @@ public final class VehicleDefense {
      */
     private static void detonate(Entity threat) {
         if (SbwDefenseConfig.APS_WARHEAD_DETONATES.get() && threat instanceof FastThrowableProjectile warhead) {
-            capExternalBlast(threat, warhead);
+            capExternalBlast(warhead, isExternalAmmo(threat));
             warhead.causeExplode(threat.position());
         }
         if (threat instanceof DestroyableProjectile dp) dp.setHealth(0.0F);
@@ -446,59 +550,50 @@ public final class VehicleDefense {
 
     private static EraState era(VehicleEntity v) {
         if (!SbwDefenseConfig.ERA_ENABLE.get()) return null;
-        int[] cells = eraCells(v);
+        DefenseLayouts.Layout layout = DefenseLayouts.forVehicle(v);
+        int[] cells = eraCells(layout);
         int blocksPerCell = SbwDefenseConfig.ERA_BLOCKS_PER_CELL.get();
         EraState st = ERA.get(v.getUUID());
         // rebuild when the layout changes (vehicle swapped its entry, or the config moved)
-        if (st == null || !java.util.Arrays.equals(st.cells, cells) || st.blocksPerCell != blocksPerCell) {
-            st = new EraState(cells, blocksPerCell);
-            ERA.put(v.getUUID(), st);
+        if (st != null && st.layout == layout
+                && st.blocksPerCell == blocksPerCell && Arrays.equals(st.cells, cells)) {
+            return st;
         }
+        st = new EraState(layout, cells, blocksPerCell);
+        ERA.put(v.getUUID(), st);
         return st;
     }
 
     /** ERA cell count per face, in Face ordinal order: layout entry first, else the config value. */
-    private static int[] eraCells(VehicleEntity v) {
-        DefenseLayouts.Layout layout = DefenseLayouts.forVehicle(v);
+    private static int[] eraCells(DefenseLayouts.Layout layout) {
         if (layout != null && layout.eraCells() != null) return layout.eraCells();
         int n = Math.max(0, SbwDefenseConfig.ERA_CELLS_PER_FACE.get());
-        int[] cells = new int[Face.values().length];
-        java.util.Arrays.fill(cells, n);
+        int[] cells = new int[FACES.length];
+        Arrays.fill(cells, n);
         return cells;
     }
 
     private static ApsState aps(VehicleEntity v) {
         if (!SbwDefenseConfig.APS_ENABLE.get()) return null;
-        int[] max = sectorTubes(v);
-        ApsState st = APS.get(v.getUUID());
-        // the layout can change between sessions (or when a vehicle id is swapped), so rebuild
-        // whenever the sector count no longer matches instead of silently refusing to fire
-        if (st == null || st.max.length != max.length) {
-            st = new ApsState(max);
-            APS.put(v.getUUID(), st);
-        }
-        return st;
-    }
-
-    /**
-     * Per-sector tube capacity for this hull. Only vehicles listed in the layout table carry a
-     * hard-kill system: no entry (and no {@code default} ring) means the hull has no APS at all.
-     */
-    private static int[] sectorTubes(VehicleEntity v) {
         DefenseLayouts.Layout layout = DefenseLayouts.forVehicle(v);
-        if (layout == null || layout.count() == 0) return new int[0];
+        ApsState st = APS.get(v.getUUID());
+        int sectors = layout == null ? 0 : layout.count();
+        if (st != null && st.layout == layout && st.max.length == sectors) return st;
 
-        int[] max = new int[layout.count()];
-        for (int i = 0; i < max.length; i++) {
+        int[] max = new int[sectors];
+        for (int i = 0; i < sectors; i++) {
             max[i] = Math.max(0, Math.min(8, layout.sectors().get(i).tubes()));
         }
-        return max;
+        st = new ApsState(layout, max);
+        APS.put(v.getUUID(), st);
+        return st;
     }
 
     /** How many tube groups this hull carries (0 when uncovered or APS is off) - used by the HUD. */
     public static int apsSectorCount(VehicleEntity v) {
-        if (v == null || !isCovered(v) || !SbwDefenseConfig.APS_ENABLE.get()) return 0;
-        return sectorTubes(v).length;
+        if (v == null || !isCovered(v)) return 0;
+        ApsState st = aps(v);
+        return st == null ? 0 : st.max.length;
     }
 
     /** Remaining ERA percentage (for HUD), -1 when the vehicle has no ERA / ERA is off. */
@@ -527,22 +622,50 @@ public final class VehicleDefense {
     // ── shared helpers ─────────────────────────────────────────────────────
 
     private static boolean isCovered(VehicleEntity v) {
-        String id = BuiltInRegistries.ENTITY_TYPE.getKey(v.getType()).toString();
         List<? extends String> list = SbwDefenseConfig.DEFENSE_VEHICLES.get();
-        return list.contains(id) || list.contains("*");
+        // NeoForge hands out a new list after a config reload - drop the verdicts with it
+        if (list != coveredListRef) {
+            coveredListRef = list;
+            COVERED_CACHE.clear();
+        }
+        Boolean cached = COVERED_CACHE.get(v.getType());
+        if (cached != null) return cached;
+
+        ResourceLocation id = BuiltInRegistries.ENTITY_TYPE.getKey(v.getType());
+        boolean covered = false;
+        if (id != null) {
+            String key = id.toString();
+            // a hand-written entry may still say sbw_vls:<name> (VLS < 1.0.0b namespace)
+            covered = list.contains("*")
+                    || list.contains(key)
+                    || list.contains(DefenseLayouts.alias(key));
+        }
+        COVERED_CACHE.put(v.getType(), covered);
+        return covered;
     }
 
     /** True for missiles / rockets / shells / grenades - the things ERA and APS care about. */
     private static boolean isWarhead(Entity e) {
         if (e == null) return false;
         if (e instanceof DestroyableProjectile) return true;
-        ResourceLocation id = BuiltInRegistries.ENTITY_TYPE.getKey(e.getType());
-        if (id == null) return false;
-        String path = id.getPath();
-        for (String hint : WARHEAD_HINTS) {
-            if (path.contains(hint)) return true;
+
+        EntityType<?> type = e.getType();
+        Boolean cached = WARHEAD_CACHE.get(type);
+        if (cached != null) return cached;
+
+        boolean warhead = false;
+        ResourceLocation id = BuiltInRegistries.ENTITY_TYPE.getKey(type);
+        if (id != null) {
+            String path = id.getPath();
+            for (String hint : WARHEAD_HINTS) {
+                if (path.contains(hint)) {
+                    warhead = true;
+                    break;
+                }
+            }
         }
-        return false;
+        WARHEAD_CACHE.put(type, warhead);
+        return warhead;
     }
 
     /** Stops a vehicle from shooting down its own shells / its crew's thrown explosives. */

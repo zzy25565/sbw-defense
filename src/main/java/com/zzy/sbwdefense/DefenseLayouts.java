@@ -9,6 +9,7 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.world.entity.EntityType;
 import net.neoforged.fml.loading.FMLPaths;
 import org.slf4j.Logger;
 
@@ -21,6 +22,8 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Per-vehicle defensive layout: where the APS tubes sit on the hull, and which faces carry ERA.
@@ -42,10 +45,24 @@ import java.util.Map;
  *
  * <p>Vehicles without an entry fall back to {@code "default"} in the same file; when neither
  * exists the uniform {@code defense.aps.*} / {@code defense.era.*} config is used.
+ *
+ * <p>Parsing is per-vehicle and per-field defensive: a bad {@code tubes} value logs the vehicle
+ * id and the field name, falls back to that field's default and lets every other entry load.
+ * One typo can no longer cost you the rest of the table.
  */
 public final class DefenseLayouts {
 
     public static final String FILE_NAME = "sbw_defense-vehicle-layouts.json";
+
+    /**
+     * Current table schema. 3 = vehicle ids use the {@code zzyvehicles} namespace that the VLS
+     * addon adopted in 1.0.0b; older files still say {@code sbw_vls} and are rewritten on load.
+     */
+    static final int SCHEMA = 3;
+
+    /** The VLS addon merged every namespace into {@code zzyvehicles} in 1.0.0b. */
+    private static final String VLS_OLD_NS = "sbw_vls:";
+    private static final String VLS_NEW_NS = "zzyvehicles:";
 
     /** Order of the five ERA faces, matching {@link VehicleDefense} Face ordinals. */
     public static final String[] ERA_FACES = {"front", "back", "left", "right", "top"};
@@ -93,6 +110,14 @@ public final class DefenseLayouts {
     private static volatile Map<String, Layout> byVehicle = Map.of();
     private static volatile Layout fallback;
 
+    /**
+     * Entity type -&gt; resolved layout. Populated on first sight of a hull (a server tick path),
+     * so the per-tick APS loop does not hit the registry and the string map again. Cleared
+     * whenever the table is (re)loaded. {@code Optional} lets a hull without any entry be cached
+     * as "none" instead of being re-resolved every tick.
+     */
+    private static final Map<EntityType<?>, Optional<Layout>> CACHE = new ConcurrentHashMap<>();
+
     // ── lifecycle ─────────────────────────────────────────────────────────
 
     /** Called once when a server starts: create the file on first run, then parse it. */
@@ -111,6 +136,7 @@ public final class DefenseLayouts {
             logger.warn("Layout table unavailable, falling back to the config values", e);
             byVehicle = Map.of();
             fallback = null;
+            CACHE.clear();
         }
     }
 
@@ -121,22 +147,66 @@ public final class DefenseLayouts {
     }
 
     /**
-     * 1.5.x shipped the same file without {@code "_schema"}: it still had a four-sector
-     * {@code default}, which handed a hard-kill system to every vehicle in the pack. Those files
-     * are replaced by the 1.6 template (old one kept next to it as {@code .bak}).
+     * Schema 0 was 1.5.x: no {@code "_schema"} at all, and a four-sector {@code default} that
+     * handed a hard-kill system to every vehicle in the pack - replaced by the template.
+     *
+     * <p>Schema 1/2 are structurally fine but still name hulls {@code sbw_vls:*}. VLS 1.0.0b
+     * merged everything into {@code zzyvehicles}, so those keys are rewritten in place (custom
+     * entries and all) instead of being thrown away; the original file is kept as {@code .bak}.
      */
     private static void migrateLegacy(Path path, Logger logger) {
         try {
             JsonObject root = JsonParser.parseString(Files.readString(path, StandardCharsets.UTF_8))
                     .getAsJsonObject();
-            if (root.has("_schema")) return;
+            int schema = root.has("_schema") ? root.get("_schema").getAsInt() : 0;
+            if (schema >= SCHEMA) return;
+
             Path backup = path.resolveSibling(FILE_NAME + ".bak");
             Files.copy(path, backup, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-            writeDefault(path);
-            logger.info("Upgraded legacy layout table (backup: {}); unlisted vehicles no longer carry APS", backup);
+
+            if (schema == 0) {
+                writeDefault(path);
+                logger.info("Upgraded legacy layout table to schema {} (backup: {}); unlisted vehicles no longer carry APS",
+                        SCHEMA, backup);
+                return;
+            }
+
+            int renamed = 0;
+            JsonElement vehiclesEl = root.get("vehicles");
+            if (vehiclesEl != null && vehiclesEl.isJsonObject()) {
+                JsonObject rebuilt = new JsonObject();
+                for (Map.Entry<String, JsonElement> e : vehiclesEl.getAsJsonObject().entrySet()) {
+                    String key = e.getKey();
+                    String canon = canonical(key);
+                    if (!canon.equals(key)) renamed++;
+                    rebuilt.add(canon, e.getValue());
+                }
+                root.add("vehicles", rebuilt);
+            }
+            root.addProperty("_schema", SCHEMA);
+            try (Writer w = Files.newBufferedWriter(path, StandardCharsets.UTF_8)) {
+                GSON.toJson(root, w);
+            }
+            logger.info("Migrated layout table to schema {} (backup: {}), {} vehicle id(s) moved to zzyvehicles",
+                    SCHEMA, backup, renamed);
         } catch (Exception e) {
             logger.warn("Could not migrate {}: {}", FILE_NAME, e.getMessage());
         }
+    }
+
+    /**
+     * Maps a legacy {@code sbw_vls:} id onto the {@code zzyvehicles:} namespace VLS has used since
+     * 1.0.0b. Everything else (vanilla SBW hulls, other addons) passes through untouched.
+     */
+    static String canonical(String id) {
+        return id.startsWith(VLS_OLD_NS) ? VLS_NEW_NS + id.substring(VLS_OLD_NS.length()) : id;
+    }
+
+    /** The same hull under the other namespace - used to match a config entry written by hand. */
+    static String alias(String id) {
+        if (id.startsWith(VLS_OLD_NS)) return VLS_NEW_NS + id.substring(VLS_OLD_NS.length());
+        if (id.startsWith(VLS_NEW_NS)) return VLS_OLD_NS + id.substring(VLS_NEW_NS.length());
+        return id;
     }
 
     private static Path file() {
@@ -151,11 +221,13 @@ public final class DefenseLayouts {
             logger.warn("Could not read {}: {}", FILE_NAME, e.getMessage());
             byVehicle = Map.of();
             fallback = null;
+            CACHE.clear();
             return;
         }
-        Parsed parsed = parse(text);
+        Parsed parsed = parse(text, logger);
         byVehicle = parsed.vehicles();
         fallback = parsed.fallback();
+        CACHE.clear();   // cached verdicts were resolved against the previous table
         logger.info("Defensive layouts loaded: {} vehicle entries, default {}",
                 byVehicle.size(), fallback == null ? "off" : fallback.count() + " sectors");
     }
@@ -163,22 +235,48 @@ public final class DefenseLayouts {
     /** Result of one table parse: per-vehicle entries plus the {@code default} fallback. */
     record Parsed(Map<String, Layout> vehicles, Layout fallback) {}
 
-    /** Parses the layout table. Malformed entries are skipped instead of failing the whole file. */
+    /** Test-friendly entry point: parses without a logger. */
     static Parsed parse(String json) {
+        return parse(json, null);
+    }
+
+    /**
+     * Parses the layout table. A malformed <em>vehicle</em> entry is skipped on its own; a
+     * malformed <em>field</em> falls back to its default. Either way the rest of the table loads.
+     */
+    static Parsed parse(String json, Logger log) {
         Map<String, Layout> map = new HashMap<>();
         Layout def = null;
         try {
             JsonObject root = JsonParser.parseString(json).getAsJsonObject();
-            if (root.has("default")) def = parseLayout(root.get("default"));
-            if (root.has("vehicles") && root.get("vehicles").isJsonObject()) {
-                for (Map.Entry<String, JsonElement> e : root.getAsJsonObject("vehicles").entrySet()) {
-                    if (e.getKey().startsWith("_")) continue;
-                    Layout l = parseLayout(e.getValue());
-                    if (l != null && (l.count() > 0 || l.eraCells() != null)) map.put(e.getKey(), l);
+
+            if (root.has("default")) {
+                try {
+                    def = parseLayout(root.get("default"), "default", log);
+                } catch (RuntimeException e) {
+                    warn(log, "'default' layout skipped: {}", e.getMessage());
+                }
+            }
+
+            JsonElement vehicles = root.get("vehicles");
+            if (vehicles != null && vehicles.isJsonObject()) {
+                for (Map.Entry<String, JsonElement> e : vehicles.getAsJsonObject().entrySet()) {
+                    String key = e.getKey();
+                    if (key.startsWith("_")) continue;   // comment keys
+                    try {
+                        Layout l = parseLayout(e.getValue(), key, log);
+                        if (l != null && (l.count() > 0 || l.eraCells() != null)) {
+                            map.put(canonical(key), l);   // sbw_vls:* -> zzyvehicles:*
+                        }
+                    } catch (RuntimeException ex) {
+                        // one broken vehicle must never take the following entries with it
+                        warn(log, "vehicle '{}' skipped: {}", key, ex.getMessage());
+                    }
                 }
             }
         } catch (RuntimeException e) {
             // unparsable file: fall back to the uniform config rather than crashing the server
+            warn(log, "{} is not valid JSON, using config defaults: {}", FILE_NAME, e.getMessage());
         }
         return new Parsed(Map.copyOf(map), def);
     }
@@ -187,40 +285,44 @@ public final class DefenseLayouts {
 
     /** Layout for this hull, or {@code null} when the file defines neither an entry nor a default. */
     public static Layout forVehicle(VehicleEntity v) {
-        ResourceLocation id = BuiltInRegistries.ENTITY_TYPE.getKey(v.getType());
-        if (id == null) return fallback;
-        return forId(id.toString());
+        return CACHE.computeIfAbsent(v.getType(), DefenseLayouts::resolve).orElse(null);
+    }
+
+    private static Optional<Layout> resolve(EntityType<?> type) {
+        ResourceLocation id = BuiltInRegistries.ENTITY_TYPE.getKey(type);
+        return Optional.ofNullable(id == null ? fallback : forId(id.toString()));
     }
 
     public static Layout forId(String entityId) {
-        Layout l = byVehicle.get(entityId);
+        Layout l = byVehicle.get(canonical(entityId));
         return l != null ? l : fallback;
     }
 
     // ── parsing ───────────────────────────────────────────────────────────
 
-    private static Layout parseLayout(JsonElement element) {
+    private static Layout parseLayout(JsonElement element, String owner, Logger log) {
         if (element == null || !element.isJsonObject()) return null;
         JsonObject obj = element.getAsJsonObject();
 
         List<Sector> sectors = new ArrayList<>();
         JsonElement secs = obj.get("sectors");
         if (secs != null && secs.isJsonArray()) {
+            int i = 0;
             for (JsonElement se : secs.getAsJsonArray()) {
-                if (!se.isJsonObject()) continue;
-                JsonObject so = se.getAsJsonObject();
-                float azimuth = so.has("azimuth") ? so.get("azimuth").getAsFloat() : 0.0F;
-                int tubes = so.has("tubes") ? Math.max(0, Math.min(8, so.get("tubes").getAsInt())) : 1;
-                float[] mount = null;
-                JsonElement mo = so.get("mount");
-                if (mo != null && mo.isJsonArray() && mo.getAsJsonArray().size() >= 3) {
-                    JsonArray ma = mo.getAsJsonArray();
-                    mount = new float[]{
-                            ma.get(0).getAsFloat(),
-                            ma.get(1).getAsFloat(),
-                            ma.get(2).getAsFloat()};
+                String ctx = owner + ".sectors[" + i + "]";
+                i++;
+                if (!se.isJsonObject()) {
+                    warn(log, "{}: not an object, ignored", ctx);
+                    continue;
                 }
-                sectors.add(new Sector(normalise(azimuth), tubes, mount));
+                JsonObject so = se.getAsJsonObject();
+                try {
+                    float azimuth = readFloat(so, "azimuth", 0.0F, ctx, log);
+                    int tubes = Math.max(0, Math.min(8, readInt(so, "tubes", 1, ctx, log)));
+                    sectors.add(new Sector(normalise(azimuth), tubes, readMount(so, ctx, log)));
+                } catch (RuntimeException ex) {
+                    warn(log, "{}: sector skipped ({})", ctx, ex.getMessage());
+                }
             }
         }
 
@@ -230,14 +332,65 @@ public final class DefenseLayouts {
             JsonObject eo = eraEl.getAsJsonObject();
             era = new int[ERA_FACES.length];
             for (int i = 0; i < ERA_FACES.length; i++) {
-                era[i] = eo.has(ERA_FACES[i])
-                        ? Math.max(0, Math.min(64, eo.get(ERA_FACES[i]).getAsInt()))
-                        : 0;
+                era[i] = Math.max(0, Math.min(64,
+                        readInt(eo, ERA_FACES[i], 0, owner + ".era", log)));
             }
         }
 
         if (sectors.isEmpty() && era == null) return null;
         return new Layout(List.copyOf(sectors), era);
+    }
+
+    /** {@code [right, up, forward]} in blocks; a broken array is ignored (hull-centre launch). */
+    private static float[] readMount(JsonObject so, String ctx, Logger log) {
+        JsonElement mo = so.get("mount");
+        if (mo == null || mo.isJsonNull()) return null;
+        if (!mo.isJsonArray()) {
+            warn(log, "{}: 'mount' is not an array, ignored", ctx);
+            return null;
+        }
+        JsonArray ma = mo.getAsJsonArray();
+        if (ma.size() < 3) {
+            warn(log, "{}: 'mount' needs 3 values, ignored", ctx);
+            return null;
+        }
+        float[] mount = new float[3];
+        for (int k = 0; k < 3; k++) {
+            if (!isNumber(ma.get(k))) {
+                warn(log, "{}: 'mount[{}]' is not a number, ignored", ctx, k);
+                return null;
+            }
+            mount[k] = ma.get(k).getAsFloat();
+        }
+        return mount;
+    }
+
+    private static float readFloat(JsonObject o, String field, float def, String ctx, Logger log) {
+        JsonElement e = o.get(field);
+        if (e == null || e.isJsonNull()) return def;
+        if (!isNumber(e)) {
+            warn(log, "{}: '{}' is not a number ({}), using {}", ctx, field, e, def);
+            return def;
+        }
+        return e.getAsFloat();
+    }
+
+    private static int readInt(JsonObject o, String field, int def, String ctx, Logger log) {
+        JsonElement e = o.get(field);
+        if (e == null || e.isJsonNull()) return def;
+        if (!isNumber(e)) {
+            warn(log, "{}: '{}' is not a number ({}), using {}", ctx, field, e, def);
+            return def;
+        }
+        return e.getAsInt();
+    }
+
+    private static boolean isNumber(JsonElement e) {
+        return e.isJsonPrimitive() && e.getAsJsonPrimitive().isNumber();
+    }
+
+    private static void warn(Logger log, String message, Object... args) {
+        if (log != null) log.warn(message, args);
     }
 
     /** Normalises any angle into [-180, 180). */
@@ -254,10 +407,12 @@ public final class DefenseLayouts {
 
     static final String DEFAULT_FILE = """
             {
-              "_schema": 2,
+              "_schema": 3,
               "_readme": [
                 "主防（APS）发射管位置 + 爆反（ERA）覆盖表 —— 改完重启服务器或重进世界生效",
                 "",
+                "载具 ID 用 zzyvehicles:<文件名>（VLS 附属 1.0.0b 起合并命名空间）；",
+                "   旧版写的 sbw_vls:<文件名> 在读取时自动按同名映射，老的配置文件也会被改写并留 .bak。",
                 "azimuth: 相对车头的方位角（度，顺时针为正）",
                 "   0 = 车头    90 = 车体右侧    180 / -180 = 车尾    -90 / 270 = 车体左侧",
                 "tubes:   该扇区发射管数；填 0 表示这个方向是盲区（永远不会往那边开火）",
@@ -272,11 +427,12 @@ public final class DefenseLayouts {
                 "",
                 "下面的条目按「现实里真的装了这套东西」的车型预填，mount 取自各车模型的",
                 "TurretPos / OBB 尺寸；模型里带 APS/ERA 骨骼的车（vt4a1、vt4b、ztz99bh 等）以骨骼为准。",
-                "没有 prefill 的车仍然吃配置里的爆反默认值（defense.era.cellsPerFace）。"
+                "没有 prefill 的车仍然吃配置里的爆反默认值（defense.era.cellsPerFace）。",
+                "某个车型写错（比如 tubes 填成文字）只跳过这一个字段并写日志，不影响其他车型。"
               ],
               "vehicles": {
                 "_comment_aps_gl5": "GL5 硬杀：炮塔前侧两组发射器，尾部无覆盖",
-                "sbw_vls:vt4a1": {
+                "zzyvehicles:vt4a1": {
                   "sectors": [
                     { "azimuth": -40, "tubes": 2, "mount": [-0.30, 0.95, 0.35] },
                     { "azimuth": 40, "tubes": 2, "mount": [0.30, 0.95, 0.35] },
@@ -284,7 +440,7 @@ public final class DefenseLayouts {
                   ],
                   "era": { "front": 12, "left": 10, "right": 10, "top": 6, "back": 0 }
                 },
-                "sbw_vls:vt4b": {
+                "zzyvehicles:vt4b": {
                   "sectors": [
                     { "azimuth": -40, "tubes": 2, "mount": [-0.28, 0.82, 0.28] },
                     { "azimuth": 40, "tubes": 2, "mount": [0.28, 0.82, 0.28] },
@@ -292,7 +448,7 @@ public final class DefenseLayouts {
                   ],
                   "era": { "front": 12, "left": 10, "right": 10, "top": 6, "back": 0 }
                 },
-                "sbw_vls:ztz99bh": {
+                "zzyvehicles:ztz99bh": {
                   "sectors": [
                     { "azimuth": -45, "tubes": 2 },
                     { "azimuth": 45, "tubes": 2 },
@@ -301,14 +457,14 @@ public final class DefenseLayouts {
                   "era": { "front": 12, "left": 10, "right": 10, "top": 8, "back": 0 }
                 },
                 "_comment_aps_trophy": "Trophy：炮塔两侧各一具发射器，四部雷达覆盖全向",
-                "sbw_vls:m1a2sepv2": {
+                "zzyvehicles:m1a2sepv2": {
                   "sectors": [
                     { "azimuth": 90, "tubes": 2, "mount": [0.52, 0.90, 0.45] },
                     { "azimuth": -90, "tubes": 2, "mount": [-0.52, 0.90, 0.45] }
                   ],
                   "era": { "front": 8, "left": 10, "right": 10, "top": 8, "back": 4 }
                 },
-                "sbw_vls:abrams_x": {
+                "zzyvehicles:abrams_x": {
                   "sectors": [
                     { "azimuth": 90, "tubes": 2 },
                     { "azimuth": -90, "tubes": 2 }
@@ -317,57 +473,82 @@ public final class DefenseLayouts {
                 },
 
                 "_comment_era_relict": "苏系 Relikt / Kontakt，尾部与发动机舱盖无爆反",
-                "sbw_vls:t72b": {
+                "zzyvehicles:t72_b3m": {
                   "sectors": [],
                   "era": { "front": 12, "left": 10, "right": 10, "top": 8, "back": 0 }
                 },
-                "sbw_vls:t72b3": {
+                "zzyvehicles:t72b": {
                   "sectors": [],
                   "era": { "front": 12, "left": 10, "right": 10, "top": 8, "back": 0 }
                 },
-                "sbw_vls:t80b": {
+                "zzyvehicles:t72b3": {
                   "sectors": [],
                   "era": { "front": 12, "left": 10, "right": 10, "top": 8, "back": 0 }
                 },
-                "sbw_vls:t90_msa": {
+                "zzyvehicles:t80b": {
+                  "sectors": [],
+                  "era": { "front": 12, "left": 10, "right": 10, "top": 8, "back": 0 }
+                },
+                "zzyvehicles:t90_msa": {
                   "sectors": [],
                   "era": { "front": 12, "left": 10, "right": 10, "top": 10, "back": 0 }
                 },
-                "sbw_vls:t90_msa_keep": {
+                "zzyvehicles:t90_msa_keep": {
                   "sectors": [],
                   "era": { "front": 12, "left": 10, "right": 10, "top": 10, "back": 0 }
                 },
-                "sbw_vls:t90mh": {
+                "zzyvehicles:t90mh": {
                   "sectors": [],
                   "era": { "front": 12, "left": 12, "right": 12, "top": 10, "back": 0 }
                 },
-                "sbw_vls:project640": {
+                "zzyvehicles:project640": {
                   "sectors": [],
                   "era": { "front": 12, "left": 10, "right": 10, "top": 10, "back": 4 }
                 },
-                "sbw_vls:bmpt72": {
+                "zzyvehicles:bmpt72": {
                   "sectors": [],
                   "era": { "front": 10, "left": 8, "right": 8, "top": 4, "back": 0 }
                 },
-
-                "_comment_era_fy4": "国产 FY-4 反应装甲",
-                "sbw_vls:ztz96a": {
+                "_comment_era_heavy": "BVM / Oplot / K1 这类重爆反车：侧裙与炮塔顶也有块",
+                "zzyvehicles:t_80bvm": {
+                  "sectors": [],
+                  "era": { "front": 12, "left": 12, "right": 12, "top": 10, "back": 0 }
+                },
+                "zzyvehicles:t_80u": {
+                  "sectors": [],
+                  "era": { "front": 12, "left": 10, "right": 10, "top": 8, "back": 0 }
+                },
+                "zzyvehicles:oplot": {
+                  "sectors": [],
+                  "era": { "front": 12, "left": 10, "right": 10, "top": 8, "back": 0 }
+                },
+                "zzyvehicles:k1a1": {
                   "sectors": [],
                   "era": { "front": 10, "left": 8, "right": 8, "top": 6, "back": 0 }
                 },
-                "sbw_vls:ztz99a": {
+
+                "_comment_era_fy4": "国产 FY-4 反应装甲",
+                "zzyvehicles:ztz96a": {
+                  "sectors": [],
+                  "era": { "front": 10, "left": 8, "right": 8, "top": 6, "back": 0 }
+                },
+                "zzyvehicles:ztz99a": {
                   "sectors": [],
                   "era": { "front": 12, "left": 10, "right": 10, "top": 8, "back": 0 }
                 },
-                "sbw_vls:ztz99ah": {
+                "zzyvehicles:ztz99ah": {
                   "sectors": [],
                   "era": { "front": 12, "left": 10, "right": 10, "top": 8, "back": 0 }
                 },
-                "sbw_vls:ztq15": {
+                "zzyvehicles:ztq15": {
                   "sectors": [],
                   "era": { "front": 10, "left": 8, "right": 8, "top": 4, "back": 0 }
                 },
-                "sbw_vls:m1a1hc": {
+                "zzyvehicles:m1a2sepv1": {
+                  "sectors": [],
+                  "era": { "front": 8, "left": 10, "right": 10, "top": 6, "back": 0 }
+                },
+                "zzyvehicles:m1a1hc": {
                   "sectors": [],
                   "era": { "front": 8, "left": 10, "right": 10, "top": 6, "back": 0 }
                 }
